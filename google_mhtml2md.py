@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-google_mhtml2md.py — Convert Google AI Mode .mhtml files to clean Markdown.
+mhtml2md.py — Convert Google AI Mode .mhtml files to clean Markdown.
 
 Google AI Mode conversations saved via Chrome's "Save as single file"
 (.mhtml) contain quoted-printable encoded HTML wrapped in Google's
@@ -13,7 +13,7 @@ Usage:
     python3 mhtml2md.py *.mhtml                      # batch convert
     python3 mhtml2md.py input.mhtml --include-sources # include citation URLs
 
-Author: Thomas Horsten <thomas@horsten.com> & Claude Opus 4.6
+Author: Thomas (Copenhagen) & Claude
 License: MIT
 """
 
@@ -90,18 +90,50 @@ def extract_html_from_mhtml(mhtml_path: str) -> tuple[str, dict]:
 def clean_text(text: str) -> str:
     """Remove Google framework artifacts from text."""
     text = re.sub(r'<!--.*?-->', '', text, flags=re.DOTALL)
-    # Remove TgQPHd data markers (including bracketed content)
-    text = re.sub(r'TgQPHd\|\S*', '', text)
-    # Remove qkimaf/cqw1tb framework markers — these appear as
-    # "qkimaf XXX_YY/ZZZcqw1tb XXX_YY/ZZZ" concatenated together
-    text = re.sub(r'qkimaf\s+\S+?cqw1tb\s+\S+', '', text)
-    text = re.sub(r'qkimaf\s+\S+', '', text)
-    text = re.sub(r'cqw1tb\s+\S+', '', text)
-    # Clean &quot; artifacts FIRST, before citation removal
+
+    # ── General Google framework marker removal ──
+    # Google's JS framework injects identifier tokens (e.g. TgQPHd, Sv6Kpe,
+    # qkimaf, cqw1tb, BipLCb, BVUQsc) as text nodes. These follow patterns:
+    #   - "Token[...]" — data markers with bracketed content
+    #   - "Token|..." — pipe-delimited data markers
+    #   - "Token XXX/YYY" — path-style markers
+    # The token is typically 5-10 alphanumeric chars starting with a letter,
+    # containing mixed case or digits (not a normal English word).
+
+    # Helper pattern for framework token identifiers:
+    # 5-10 chars, starts with letter, contains at least one uppercase and one
+    # lowercase, often has digits. Examples: Sv6Kpe, TgQPHd, BipLCb, BVUQsc
+    _TOK = r'[A-Za-z][A-Za-z0-9]{4,9}'
+
+    # Pattern 1: Token[...] — greedy match from [ to the last ] on the line
+    text = re.sub(_TOK + r'\[.*?\](?:\])*', '', text)
+    # Pattern 1b: Token[... with unclosed bracket (truncated data)
+    text = re.sub(_TOK + r'\[\[?[^\]]*$', '', text, flags=re.MULTILINE)
+    # Pattern 1c: Simple Token[] that might remain
+    text = re.sub(_TOK + r'\[\]', '', text)
+
+    # Pattern 2: Token|data (TgQPHd|[...])
+    text = re.sub(_TOK + r'\|[^\s]*', '', text)
+
+    # Pattern 3: Token path/data — "BVUQsc crI50d_g/fmcmS" style
+    text = re.sub(_TOK + r'\s+[A-Za-z0-9_]+/[A-Za-z0-9_]+', '', text)
+
+    # Pattern 4: Paired path markers: "qkimaf X/Ycqw1tb X/Y"
+    text = re.sub(r'[a-z]{4,10}\s+\S+?/\S+(?:[a-z]{4,10}\s+\S+/\S+)?', '', text)
+
+    # Pattern 5: base64 image data blobs that leaked into text
+    text = re.sub(r'data:image/[^"\s]+', '', text)
+
+    # ── HTML entity and citation cleanup ──
     text = text.replace('&quot;', '"')
-    # Remove citation chip remnants: "SourceName +N ...optional junk..."
-    text = re.sub(r'(?:GitHub Docs|Medium|Markdown Guide|Reddit|Angular\.love)\s*\+\d+(?:\s+\S*"[^]]*\]\])?', '', text)
-    # Catch any remaining "Word",N]]" patterns from partially stripped citation chips
+    text = text.replace('&amp;', '&')
+    text = text.replace('&lt;', '<')
+    text = text.replace('&gt;', '>')
+    # Remove citation chip remnants: "SourceName +N ..."
+    text = re.sub(r'(?:GitHub Docs|Medium|Markdown Guide|Reddit|Angular\.love|'
+                  r'CommonMark|Meta Stack Exchange|Wikimedia Foundation|'
+                  r'Wikipedia|Forbes|ResearchGate|SpringerLink)\s*\+\d+(?:\s+\S*"[^]]*\]\])?', '', text)
+    # Catch remaining "Word",N]]" patterns from partially stripped citation chips
     text = re.sub(r'\w*",?\d*\]*\]\]', '', text)
     # Unicode escapes
     text = text.replace('\\u003d', '=').replace('\\u0026', '&')
@@ -127,6 +159,9 @@ def is_ui_noise(text: str) -> bool:
         r'^See our\s*Privacy Policy',
         r'^Ask anything$',
         r'^Show all$',
+        r'^Learn more$',
+        r'^Here are top web results',
+        r'^\d+\s+sites?$',
     ]
     for pattern in noise_patterns:
         if re.match(pattern, text, re.I):
@@ -147,13 +182,8 @@ def extract_inline_text(element: Tag, include_sources: bool = False) -> str:
 
     for child in element.children:
         if isinstance(child, NavigableString):
-            text = str(child)
-            text = re.sub(r'<!--.*?-->', '', text, flags=re.DOTALL)
-            text = re.sub(r'TgQPHd\|\S*', '', text)
-            text = re.sub(r'qkimaf\s+\S+?cqw1tb\s+\S+', '', text)
-            text = re.sub(r'qkimaf\s+\S+', '', text)
-            text = re.sub(r'cqw1tb\s+\S+', '', text)
-            if text.strip():
+            text = clean_text(str(child))
+            if text:
                 parts.append(text)
 
         elif isinstance(child, Tag):
@@ -329,14 +359,9 @@ def extract_list(element: Tag, include_sources: bool = False, depth: int = 0) ->
         text_parts = []
         for child in li.children:
             if isinstance(child, NavigableString):
-                t = str(child)
-                t = re.sub(r'<!--.*?-->', '', t, flags=re.DOTALL)
-                t = re.sub(r'TgQPHd\|\S*', '', t)
-                t = re.sub(r'qkimaf\s+\S+?cqw1tb\s+\S+', '', t)
-                t = re.sub(r'qkimaf\s+\S+', '', t)
-                t = re.sub(r'cqw1tb\s+\S+', '', t)
-                if t.strip():
-                    text_parts.append(t.strip())
+                t = clean_text(str(child))
+                if t:
+                    text_parts.append(t)
             elif isinstance(child, Tag):
                 # Skip sublists — we'll recurse into them separately
                 if child.name in ('ul', 'ol'):
