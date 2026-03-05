@@ -47,6 +47,18 @@ def extract_html_from_mhtml(mhtml_path: str) -> tuple[str, dict]:
         'url': msg.get('Snapshot-Content-Location', ''),
     }
 
+    # Decode MIME Q-encoded subject lines (common with non-ASCII characters)
+    if metadata['subject'] and ('=?' in metadata['subject']):
+        try:
+            from email.header import decode_header
+            decoded_parts = decode_header(metadata['subject'])
+            metadata['subject'] = ''.join(
+                part.decode(enc or 'utf-8') if isinstance(part, bytes) else part
+                for part, enc in decoded_parts
+            )
+        except Exception:
+            pass  # Keep the raw subject if decoding fails
+
     # Extract query from subject
     subject = metadata['subject']
     if subject.endswith(' - Google Search'):
@@ -473,48 +485,109 @@ def extract_conversation(html: str, include_sources: bool = False) -> list[dict]
     """
     Extract conversation turns from Google AI Mode HTML.
 
-    Structure (as of early 2026):
-    - div.tonYlb = conversation turn container (one per user→AI exchange)
-      - span.VndcI = user message text
+    Google uses (at least) two layout variants:
+
+    Variant A (short conversations):
+    - div.tonYlb = one per user→AI exchange
+      - span.VndcI = user message
       - div.CKgc1d = AI response wrapper
-        - div.mZJni.Dn7Fzd = AI response content area
-          - div.Y3BBE = text paragraph (bold, links, inline code)
-          - div.otQkpb = section heading
-          - div.r1PmQe = code block container (pre > code)
-          - div.Fv6NCb = table container
-          - div.Fsg96 = source citation chip
+
+    Variant B (long/multi-turn conversations):
+    - div.tonYlb.Uphzyf = mega-container for the entire conversation
+      - div.CKgc1d (multiple) = each wraps one turn pair:
+        - div.ilZyRc > span.VndcI = user message
+        - div.Zkbeff > div.mZJni = AI response content
     """
     soup = BeautifulSoup(html, 'html.parser')
     conversation = []
 
-    # Find conversation turn containers
-    turn_containers = soup.find_all('div', class_=re.compile(r'\btonYlb\b'))
+    # ── Strategy 1: Look for CKgc1d containers that wrap user+AI pairs ──
+    # This is the "long conversation" layout (Variant B).
+    ck_divs = soup.find_all('div', class_=re.compile(r'\bCKgc1d\b'))
 
-    if not turn_containers:
-        # Fallback: try CKgc1d directly
-        ck_divs = soup.find_all('div', class_=re.compile(r'\bCKgc1d\b'))
-        if ck_divs:
-            for ck in ck_divs:
-                ai_md = _extract_ai_response(ck, include_sources)
-                if ai_md:
-                    conversation.append({'role': 'assistant', 'content': ai_md})
-            return conversation if conversation else _fallback_extraction(soup)
-        return _fallback_extraction(soup)
+    # Detect Variant B: CKgc1d contains an ilZyRc (user message container)
+    variant_b_turns = []
+    variant_a_ck = []
+    for ck in ck_divs:
+        user_container = ck.find('div', class_=re.compile(r'\bilZyRc\b'), recursive=False)
+        if user_container:
+            variant_b_turns.append(ck)
+        else:
+            variant_a_ck.append(ck)
 
-    for turn in turn_containers:
-        # ── User message ──
-        user_span = turn.find('span', class_=re.compile(r'\bVndcI\b'))
-        if user_span:
-            user_text = clean_text(user_span.get_text())
-            if user_text:
-                conversation.append({'role': 'user', 'content': user_text})
+    if variant_b_turns:
+        # ── Variant B: each CKgc1d has user + AI ──
+        for ck in variant_b_turns:
+            # Extract user message
+            user_span = ck.find('span', class_=re.compile(r'\bVndcI\b'))
+            if user_span:
+                user_text = clean_text(user_span.get_text())
+                if user_text:
+                    conversation.append({'role': 'user', 'content': user_text})
 
-        # ── AI response ──
-        ai_container = turn.find('div', class_=re.compile(r'\bCKgc1d\b'))
-        if ai_container:
-            ai_md = _extract_ai_response(ai_container, include_sources)
+            # Extract AI response from the Zkbeff sibling of ilZyRc
+            ai_md = _extract_ai_response(ck, include_sources)
             if ai_md:
                 conversation.append({'role': 'assistant', 'content': ai_md})
+
+        # There may also be standalone Variant A turns (e.g. last turn
+        # in a different tonYlb). Process remaining CKgc1d containers
+        # that weren't part of Variant B.
+        for ck in variant_a_ck:
+            # Check if this CKgc1d is inside a tonYlb that also has a VndcI
+            parent_tony = ck.find_parent('div', class_=re.compile(r'\btonYlb\b'))
+            if parent_tony:
+                # Only add if we haven't already captured this turn
+                user_span = parent_tony.find('span', class_=re.compile(r'\bVndcI\b'))
+                if user_span:
+                    user_text = clean_text(user_span.get_text())
+                    # Avoid duplicates
+                    if user_text and not any(
+                        t['role'] == 'user' and t['content'] == user_text
+                        for t in conversation
+                    ):
+                        conversation.append({'role': 'user', 'content': user_text})
+
+                ai_md = _extract_ai_response(ck, include_sources)
+                if ai_md and not any(
+                    t['role'] == 'assistant' and t['content'] == ai_md
+                    for t in conversation
+                ):
+                    conversation.append({'role': 'assistant', 'content': ai_md})
+
+        if conversation:
+            return conversation
+
+    # ── Strategy 2: Variant A — individual tonYlb turn containers ──
+    turn_containers = soup.find_all('div', class_=re.compile(r'\btonYlb\b'))
+
+    if turn_containers:
+        for turn in turn_containers:
+            user_span = turn.find('span', class_=re.compile(r'\bVndcI\b'))
+            if user_span:
+                user_text = clean_text(user_span.get_text())
+                if user_text:
+                    conversation.append({'role': 'user', 'content': user_text})
+
+            ai_container = turn.find('div', class_=re.compile(r'\bCKgc1d\b'))
+            if ai_container:
+                ai_md = _extract_ai_response(ai_container, include_sources)
+                if ai_md:
+                    conversation.append({'role': 'assistant', 'content': ai_md})
+
+        if conversation:
+            return conversation
+
+    # ── Strategy 3: CKgc1d only (no tonYlb at all) ──
+    if ck_divs:
+        for ck in ck_divs:
+            ai_md = _extract_ai_response(ck, include_sources)
+            if ai_md:
+                conversation.append({'role': 'assistant', 'content': ai_md})
+        if conversation:
+            return conversation
+
+    return _fallback_extraction(soup)
 
     if not conversation:
         return _fallback_extraction(soup)
